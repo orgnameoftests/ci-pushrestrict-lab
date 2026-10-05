@@ -28,10 +28,7 @@ jobs:
           echo "--- public protection summary on the branch object ---"
           curl -sS -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/branches/master" \
-            | python3 -c 'import json,sys
-d=json.load(sys.stdin)
-p=d.get("protection",{})
-print("protection:",json.dumps(p))'
+            | jq -c '.protection'
           echo "--- push allowlist as the job token can see it ---"
           curl -sS -w "\nHTTP_STATUS=%{http_code}\n" -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/branches/master/protection/restrictions"
@@ -60,10 +57,7 @@ print("protection:",json.dumps(p))'
           echo "--- step 2: self-certify every required context (no-op if there are none) ---"
           CTX=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/branches/master" \
-            | python3 -c 'import json,sys
-d=json.load(sys.stdin)
-try: print(" ".join(d["protection"]["required_status_checks"]["contexts"]))
-except Exception: print("")')
+            | jq -r '(.protection.required_status_checks.contexts // []) | join(" ")')
           echo "REQUIRED_CONTEXTS=[${CTX}]"
           for c in $CTX; do
             printf '{"state":"success","context":"%s","description":"self-certified by the workflow token"}' "$c" > st.json
@@ -72,15 +66,13 @@ except Exception: print("")')
               -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
               --data-binary @st.json \
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
-              | python3 -c 'import sys;print(sys.stdin.read()[:700])'
+              | jq -c '{context,state,creator:.creator.login,avatar:.creator.avatar_url}'
           done
 
           echo "--- step 3: combined status for the candidate commit ---"
           curl -sS -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${SHA}/status" \
-            | python3 -c 'import json,sys
-d=json.load(sys.stdin)
-print("state=",d["state"],"contexts=",[(s["context"],s["state"],s["creator"]["login"]) for s in d["statuses"]])'
+            | jq -c '{state, statuses:[.statuses[]|{context,state,creator:.creator.login}]}'
 
           echo "--- step 4: git push the candidate to master ---"
           git push origin HEAD:master > p4.txt 2>&1
@@ -106,7 +98,6 @@ print("state=",d["state"],"contexts=",[(s["context"],s["state"],s["creator"]["lo
           curl -sS -w '\nHTTP_STATUS=%{http_code}\n' -X PUT \
             -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
             --data-binary @body.json \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/probe/rest-${GITHUB_RUN_ID}.txt" \
-            | python3 -c 'import sys;print(sys.stdin.read()[:900])'
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/probe/rest-${GITHUB_RUN_ID}.txt"
           echo "=== END VERBATIM REST API RESPONSE ==="
           exit 0
