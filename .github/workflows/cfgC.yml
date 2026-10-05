@@ -1,0 +1,112 @@
+name: cfgC-pushrestrict
+# Config C: does a branch-protection push allowlist (`restrictions`) stop the automatic
+# GITHUB_TOKEN from landing a commit on the protected default branch?
+# No `permissions:` block anywhere, so the job inherits the default workflow permission.
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: 'configuration label'
+        required: true
+        default: 'C1'
+
+jobs:
+  pushrestrict:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Confirm the checkout credential is persisted (value redacted)
+        run: |
+          sed -E 's/(AUTHORIZATION: basic ).*/\1<REDACTED>/I' .git/config | grep -i extraheader || echo "no extraheader"
+
+      - name: Read the protection summary and the push allowlist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          echo "--- public protection summary on the branch object ---"
+          curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/branches/master" \
+            | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+p=d.get("protection",{})
+print("protection:",json.dumps(p))'
+          echo "--- push allowlist as the job token can see it ---"
+          curl -sS -w "\nHTTP_STATUS=%{http_code}\n" -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/branches/master/protection/restrictions"
+          exit 0
+
+      - name: Build a commit, self-certify any required context, then push master
+        env:
+          LABEL: ${{ inputs.label }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          git config user.name  "ci-lab-bot"
+          git config user.email "ci-lab-bot@users.noreply.github.com"
+          mkdir -p probe
+          printf 'run=%s config=%s at=%s\n' "$GITHUB_RUN_ID" "$LABEL" "$(date -u +%FT%TZ)" \
+            > "probe/cfgC-${GITHUB_RUN_ID}.txt"
+          git add probe
+          git commit -q -m "cfgC candidate commit (${GITHUB_RUN_ID})"
+          SHA=$(git rev-parse HEAD)
+          echo "CANDIDATE_SHA=$SHA"
+
+          echo "--- step 1: push the candidate to a side branch (unprotected) ---"
+          git push origin "HEAD:refs/heads/probe/cfgC-${GITHUB_RUN_ID}" > p1.txt 2>&1
+          echo "SIDE_BRANCH_PUSH_EXIT=$?"; cat p1.txt
+
+          echo "--- step 2: self-certify every required context (no-op if there are none) ---"
+          CTX=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/branches/master" \
+            | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+try: print(" ".join(d["protection"]["required_status_checks"]["contexts"]))
+except Exception: print("")')
+          echo "REQUIRED_CONTEXTS=[${CTX}]"
+          for c in $CTX; do
+            printf '{"state":"success","context":"%s","description":"self-certified by the workflow token"}' "$c" > st.json
+            echo "-- POST /statuses for context $c --"
+            curl -sS -w '\nHTTP_STATUS=%{http_code}\n' -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              --data-binary @st.json \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+              | python3 -c 'import sys;print(sys.stdin.read()[:700])'
+          done
+
+          echo "--- step 3: combined status for the candidate commit ---"
+          curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${SHA}/status" \
+            | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print("state=",d["state"],"contexts=",[(s["context"],s["state"],s["creator"]["login"]) for s in d["statuses"]])'
+
+          echo "--- step 4: git push the candidate to master ---"
+          git push origin HEAD:master > p4.txt 2>&1
+          rc=$?
+          echo "=== BEGIN VERBATIM GIT PUSH OUTPUT (config ${LABEL}) ==="
+          cat p4.txt
+          echo "=== END VERBATIM GIT PUSH OUTPUT ==="
+          echo "PUSH_EXIT_STATUS=${rc}"
+          echo "=== remote refs/heads/master after the attempt ==="
+          git ls-remote origin refs/heads/master
+          echo "EXPECTED_SHA=$SHA"
+          exit 0
+
+      - name: Attempt the same write through the REST Contents API with the same token
+        env:
+          LABEL: ${{ inputs.label }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          B64=$(printf 'rest route, config %s, run %s\n' "$LABEL" "$GITHUB_RUN_ID" | base64 -w0)
+          printf '{"message":"cfgC rest route (%s)","content":"%s","branch":"master"}' "$GITHUB_RUN_ID" "$B64" > body.json
+          echo "=== BEGIN VERBATIM REST API RESPONSE (config ${LABEL}) ==="
+          curl -sS -w '\nHTTP_STATUS=%{http_code}\n' -X PUT \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            --data-binary @body.json \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/probe/rest-${GITHUB_RUN_ID}.txt" \
+            | python3 -c 'import sys;print(sys.stdin.read()[:900])'
+          echo "=== END VERBATIM REST API RESPONSE ==="
+          exit 0
